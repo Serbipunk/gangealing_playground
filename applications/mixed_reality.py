@@ -2,19 +2,24 @@
 This script directly applies our method to video, finding dense correspondences across time in an input video. This works
 by applying GANgealing per-frame without using any temporal information.
 """
+import cv2
 import torch
 import numpy as np
 import math
+from torchvision import transforms
 from datasets import img_dataloader
 from prepare_data import nchw_center_crop
 from models import SpatialTransformer
 from utils.vis_tools.helpers import images2grid, save_video, save_image, load_dense_label, load_cluster_dense_labels, load_pil, splat_points, get_plotly_colors, get_colorscale
 from utils.distributed import setup_distributed, primary, all_gather, get_rank, get_world_size, synchronize
+from utils.vis_tools.helpers import normalize
 from applications import base_eval_argparse, load_stn, determine_flips
 from tqdm import tqdm
 from glob import glob
 import os
-
+from operator import eq
+from PIL import Image
+from time import time
 
 def grid2vid(list_of_grids):
     # Takes a list of (H, W, C) images (or image grids), runs an all_gather to collect across GPUs and then
@@ -80,6 +85,202 @@ def number_of_clusters_annotated(path):
     return num_annos
 
 
+def display_dense_points(points, colors, alpha_channels, size=512):
+    import pickle
+    import cv2
+    # same as splat_points, just for understanding what's going on
+    canvas = np.zeros((size, size, 4), dtype=np.float32)
+    n_points = points.size(1)
+    assert(eq(points.shape, (1, n_points, 2)))
+    assert(eq(colors.shape, (1, n_points, 3)))
+    assert(eq(alpha_channels.shape, (1, n_points, 1)))
+    m_points = points.cpu().numpy()
+    m_colors = colors.cpu().numpy()
+    m_alpha_channels = alpha_channels.cpu().numpy()
+    xs = np.asarray(m_points[0, :, 0] * size + 0.5 * size, int)
+    ys = np.asarray(m_points[0, :, 1] * size + 0.5 * size, int)
+    i_outer = 0
+    for i in range(n_points):
+        x, y = xs[i], ys[i]
+        if x < 0 or x >= size or y < 0 or y >= size:
+            i_outer += 1
+            print(f"{i_outer} / {n_points} points are outside the canvas")
+            continue
+        canvas[y, x, :3] = m_colors[0, i, :]
+        canvas[y, x, 3:] = m_alpha_channels[0, i, 0: 1]
+    cv2.imwrite("/tmp/canvas.png", canvas)
+    canvas = np.asarray(canvas * 255, np.uint8)
+    return canvas
+
+@torch.inference_mode()
+def run_gangealing_on_webcam(args, t, classifier):
+    # Step (0): Set some visualization hyperparameters and create results directory:
+    alpha = 0.2
+    clustering = args.clustering
+    video_path = create_output_folder(args, clustering)
+    # Construct dataloader:
+    _transform = transforms.Compose(
+        [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)])
+    loader = img_dataloader(args.real_data_path, resolution=args.real_size, shuffle=False, batch_size=args.batch,
+                            distributed=args.distributed, infinite=False, drop_last=False, return_indices=True)
+    num_total = len(loader.dataset)
+    num_clusters = args.num_heads if clustering else 1
+    nrow = int(math.sqrt(num_clusters))
+
+    # Step (1): Load the points (and optionally colors) that we want to propagate to the input video:
+    if clustering:
+        points_per_cluster, colors_per_cluster, alpha_channels_per_cluster = \
+            load_cluster_dense_labels(args.label_path, args.num_heads, args.resolution, args.objects)
+        if args.average_path is not None:  # Optionally create a visualization of all the clusters' dense labels:
+            labeled_average_images = create_average_image_vis(args, points_per_cluster, video_path, nrow)
+            labeled_average_images = labeled_average_images.unsqueeze(0)  # (1, K, C, H, W)
+            inactive_averages = labeled_average_images * alpha - (
+                        1 - alpha)  # This can be used later to visualize cluster selection
+            C, H, W = labeled_average_images.size()[2:]
+        points_per_cluster = [SpatialTransformer.normalize(points, args.real_size, args.resolution) for points in
+                              points_per_cluster]
+    else:  # unimodal GANgealing:
+        # points, colors, alpha_channels = load_dense_label(args.label_path, args.resolution, args.objects)
+        points, colors, alpha_channels = load_dense_label(args.label_path, args.resolution, True)
+        points = SpatialTransformer.normalize(points, args.real_size, args.resolution)
+
+    # Step (2): Pre-process the RGB colors and alpha-channel values that we want to propagate to the input video:
+    if clustering and args.cluster is not None:
+        mode = 'fixed_cluster'  # clustering, always propagate from the specified cluster(s)
+        if not args.objects:
+            colors_per_cluster = [get_plotly_colors(points_per_cluster[cluster].size(1), get_colorscale(cluster)) for
+                                  cluster in range(args.num_heads)]
+        colors = [colors_per_cluster[cluster] for cluster in args.cluster]
+        colors = torch.cat(colors, 1)
+        alpha_channels = [alpha_channels_per_cluster[cluster] for cluster in args.cluster]
+        alpha_channels = torch.cat(alpha_channels, 1)
+    elif clustering:
+        mode = 'predict_cluster'  # clustering, but only propagate based on the current predicted cluster
+        if not args.objects:
+            colors = colors_per_cluster = [get_plotly_colors(points.size(1), get_colorscale(cluster)) for
+                                           cluster, points in enumerate(points_per_cluster)]
+        alpha_channels = alpha_channels_per_cluster
+    else:
+        mode = 'unimodal'  # no clustering (num_heads == 1)
+        if not args.objects:
+            colors = get_plotly_colors(points.size(1), get_colorscale(None))
+
+    # if args.DEBUG:
+    #     canvas = display_dense_points(points, colors, alpha_channels, size=args.real_size)
+    #     cv2.imwrite("/tmp/canvas_dense_points.png", canvas)
+    #     canvas2_tensor = torch.ones(1, 3, args.real_size, args.real_size, dtype=torch.float32).cuda()
+    #     splat_points(canvas2_tensor, points, sigma=args.sigma, opacity=args.opacity,
+    #                  colors=colors, alpha_channel=alpha_channels, blend_alg=args.blend_alg)
+    #     save_image(canvas2_tensor.cpu(), "/tmp/canvas_dense_points_splatted.png", normalize=True, range=(-1, 1),
+    #                padding=0)
+
+    # Step (3): Prepare some variables if we want to display the label we're propagating over the congealed video
+    if args.overlay_congealed:
+        if clustering:
+            congealed_points = [SpatialTransformer.unnormalize(points, args.real_size, args.real_size) for points in
+                                points_per_cluster]
+            congealed_colors = colors_per_cluster
+            congealed_alpha_channels = alpha_channels_per_cluster
+        else:
+            congealed_points = [SpatialTransformer.unnormalize(points, args.real_size, args.real_size)]
+            congealed_colors = [colors]
+            congealed_alpha_channels = [alpha_channels]
+
+    # Step (4): Start processing the input video.
+    cap = cv2.VideoCapture(0)
+    # Check if the webcam is opened correctly
+    if not cap.isOpened():
+        raise IOError("Cannot open webcam")
+    cv2.namedWindow('Webcam Feed', cv2.WINDOW_NORMAL)
+    cv2.namedWindow('Result', cv2.WINDOW_NORMAL)
+
+    while True:
+        # Capture frame-by-frame
+        ret, frame = cap.read()
+
+        t1 = time()
+        # If frame is read correctly ret is True
+        if not ret:
+            print("Can't receive frame (stream end?). Exiting ...")
+            break
+
+        # Display the resulting frame
+        cv2.imshow("Webcam Feed", frame)
+        input = frame[:, 80:-80, :]
+        input = cv2.resize(input, (args.real_size, args.real_size))
+        input = cv2.cvtColor(input, cv2.COLOR_BGR2RGB)
+        input = Image.fromarray(input)
+        batch = _transform(input).unsqueeze(0).cuda()
+        original_batch = batch
+        N = batch.size(0)
+
+        ## gangealing processing
+        if mode == 'unimodal' or mode == 'predict_cluster':
+            batch_flipped, flip_indices, warp_policy, active_cluster_ix = \
+                determine_flips(args, t, classifier, batch, cluster=args.cluster, return_cluster_assignments=True)
+            if clustering:
+                points_in = points_per_cluster[active_cluster_ix.item()]
+            else:  # mode == 'unimodal'
+                points_in = points.repeat(N, 1, 1)
+                # Perform the actual propagation:
+            propagated_points = t.uncongeal_points(batch_flipped, points_in, normalize_input_points=False,
+                                                   # already normalized above
+                                                   warp_policy=warp_policy,
+                                                   padding_mode=args.padding_mode, iters=args.iters)
+            # Flip points where necessary:
+            propagated_points[:, :, 0] = torch.where(flip_indices.view(-1, 1),
+                                                     args.real_size - 1 - propagated_points[:, :, 0],
+                                                     propagated_points[:, :, 0])
+        else:  # mode == 'fixed_cluster'
+            # Here we need to iterate over every cluster we want to visualize so we can propagate points
+            # from each individual cluster to the video frame(s):
+            propagated_points, active_cluster_ix = [], []
+            for cluster in args.cluster:
+                batch_flipped, flip_indices, warp_policy, active_cluster_c = \
+                    determine_flips(args, t, classifier, batch, cluster=cluster, return_cluster_assignments=True)
+                # Perform the actual propagation:
+                points_in_c = points_per_cluster[cluster].repeat(N, 1, 1)
+                propagated_points_c = t.uncongeal_points(batch_flipped, points_in_c,
+                                                         normalize_input_points=False,  # already normalized above
+                                                         warp_policy=warp_policy, padding_mode=args.padding_mode,
+                                                         iters=args.iters)
+                # Flip points where necessary:
+                propagated_points_c[:, :, 0] = torch.where(flip_indices.view(-1, 1), args.real_size - 1 - propagated_points_c[:, :, 0],
+                                                           propagated_points_c[:, :, 0])
+                propagated_points.append(propagated_points_c)
+                active_cluster_ix.append(active_cluster_c)
+            propagated_points = torch.cat(propagated_points, 1)
+            active_cluster_ix = torch.cat(active_cluster_ix, 0)
+
+        # Select the colorscale for visualization:
+        if mode == 'unimodal' or mode == 'fixed_cluster':
+            colors_in = colors.repeat(N, 1, 1)
+            alpha_channels_in = alpha_channels.repeat(N, 1, 1)
+        else:  # predict_cluster code path assumes batch size is 1
+            assert active_cluster_ix.size(0) == 1
+            colors_in = colors[active_cluster_ix.item()]
+            alpha_channels_in = alpha_channels[active_cluster_ix.item()]
+
+        video_frame = splat_points(original_batch, propagated_points, sigma=args.sigma, opacity=args.opacity,
+                                   colors=colors_in, alpha_channel=alpha_channels_in, blend_alg=args.blend_alg)
+        frame = normalize(video_frame, -1, 1, inplace=True).mul_(255)
+        frame = frame.permute(0, 2, 3, 1).to('cpu', torch.uint8).numpy()
+        frame = frame[0, :, :, :]
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        cv2.imshow("Result", frame)
+        t2 = time()
+
+        print("{:.2f} FPS {:.4f}s".format(1 / (t2 - t1), t2 - t1))
+        # Break the loop with 'q' key
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # When everything done, release the capture
+    cap.release()
+    cv2.destroyAllWindows()
+
+
 @torch.inference_mode()
 def run_gangealing_on_video(args, t, classifier):
     # Step (0): Set some visualization hyperparameters and create results directory:
@@ -125,6 +326,14 @@ def run_gangealing_on_video(args, t, classifier):
         mode = 'unimodal'  # no clustering (num_heads == 1)
         if not args.objects:
             colors = get_plotly_colors(points.size(1), get_colorscale(None))
+
+    if args.DEBUG:
+        canvas = display_dense_points(points, colors, alpha_channels, size=args.real_size)
+        cv2.imwrite("/tmp/canvas_dense_points.png", canvas)
+        canvas2_tensor = torch.ones(1, 3, args.real_size, args.real_size, dtype=torch.float32).cuda()
+        splat_points(canvas2_tensor, points, sigma=args.sigma, opacity=args.opacity,
+                     colors=colors, alpha_channel=alpha_channels, blend_alg=args.blend_alg)
+        save_image(canvas2_tensor.cpu(), "/tmp/canvas_dense_points_splatted.png", normalize=True, range=(-1, 1), padding=0)
 
     # Step (3): Prepare some variables if we want to display the label we're propagating over the congealed video
     if args.overlay_congealed:

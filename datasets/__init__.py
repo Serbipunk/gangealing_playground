@@ -1,6 +1,6 @@
 from torch.utils import data
 from torchvision import transforms
-from datasets.dataset import MultiResolutionDataset, sample_infinite_data
+from datasets.dataset import MultiResolutionDataset, VideoDataset, sample_infinite_data
 from datasets.pck_dataset import PCKDataset, sample_infinite_pck_data
 
 
@@ -19,7 +19,10 @@ _transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.
 # Convenience functions to easily load data:
 def img_dataloader(path=None, transform=_transform, resolution=256, seed=0, batch_size=64, shuffle=True, distributed=True,
                    dset=None, return_indices=False, infinite=True, subset=None, drop_last=True):
-    dset = MultiResolutionDataset(path, transform, resolution, return_indices) if dset is None else dset
+    if path.endswith(".mp4"):
+        dset = VideoDataset(path, transform, resolution, return_indices) if dset is None else dset
+    else:
+        dset = MultiResolutionDataset(path, transform, resolution, return_indices) if dset is None else dset
     if subset is not None:
         dset = data.Subset(dset, subset)
     loader = data.DataLoader(dset, batch_size=batch_size,

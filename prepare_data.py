@@ -109,7 +109,8 @@ def resize_small_side(img, target_res):
     else:
         new_h = target_res
         new_w = w * target_res // h
-    img = img.resize((new_w, new_h), Image.ANTIALIAS)
+    # img = img.resize((new_w, new_h), Image.ANTIALIAS)
+    img = img.resize((new_w, new_h), Image.LANCZOS)
     return img
 
 

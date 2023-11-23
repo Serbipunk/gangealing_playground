@@ -106,6 +106,7 @@ def download_video(video_name, online_prefix='video_1024'):
     local_path = f'data/{video_name}'
     if not os.path.isdir(local_path) and primary():  # download (only on primary process)
         web_path = f'http://efrosgans.eecs.berkeley.edu/gangealing/{online_prefix}/{video_name}'
+        # web_path = "http://127.0.0.1/test_512.mp4"  # hardcode for now
         os.makedirs(local_path)
         download_url(f'{web_path}/data.mdb', local_path)
         download_url(f'{web_path}/lock.mdb', local_path)
